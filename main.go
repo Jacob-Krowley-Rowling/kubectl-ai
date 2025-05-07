@@ -24,6 +24,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -504,10 +505,43 @@ func (s *session) answerQuery(ctx context.Context, query string) error {
 		infoBlock.AppendText(strings.Join(models, "\n"))
 		s.doc.AddBlock(infoBlock)
 
+	case strings.Contains(query, "tail its logs"):
+		// Extract deployment name from query (basic parsing for now)
+		deploymentName := extractDeploymentName(query)
+		if deploymentName == "" {
+			return fmt.Errorf("could not extract deployment name from query")
+		}
+
+		// Wait for the deployment to become available
+		waitCmd := exec.Command("kubectl", "wait", "--for=condition=available", fmt.Sprintf("deployment/%s", deploymentName), "--timeout=300s")
+		if err := waitCmd.Run(); err != nil {
+			return fmt.Errorf("failed to wait for deployment: %w", err)
+		}
+
+		// Stream logs
+		logCmd := exec.Command("kubectl", "logs", "-f", fmt.Sprintf("deployment/%s", deploymentName))
+		logCmd.Stdout = os.Stdout
+		logCmd.Stderr = os.Stderr
+		if err := logCmd.Run(); err != nil {
+			return fmt.Errorf("failed to stream logs: %w", err)
+		}
+
 	default:
 		return s.conversation.RunOneRound(ctx, query)
 	}
 	return nil
+}
+
+// extractDeploymentName is a helper function to extract the deployment name from the query.
+func extractDeploymentName(query string) string {
+	// Basic parsing to extract deployment name (improve as needed)
+	words := strings.Fields(query)
+	for i, word := range words {
+		if word == "deployment" && i+1 < len(words) {
+			return words[i+1]
+		}
+	}
+	return ""
 }
 
 // Redirect standard log output to our custom klog writer
