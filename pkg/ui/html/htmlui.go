@@ -41,6 +41,30 @@ type HTMLUserInterface struct {
 	markdownRenderer *glamour.TermRenderer
 }
 
+// julesAuthMiddleware performs token-based authentication.
+func julesAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := r.Header.Get("X-Jules-Token")
+		allowedToken := os.Getenv("JULES_SECRET_TOKEN")
+
+		// In a real application, use a more secure way to compare tokens, like crypto/hmac.
+		// For this example, direct string comparison is used.
+		// Also, ensure allowedToken is actually set.
+		if allowedToken == "" {
+			klog.Warning("JULES_SECRET_TOKEN is not set. Authentication will fail.")
+			http.Error(w, "Unauthorized: JULES_SECRET_TOKEN not configured", http.StatusUnauthorized)
+			return
+		}
+
+		if token == "" || token != allowedToken {
+			klog.Warningf("Unauthorized access attempt with token: %q", token)
+			http.Error(w, "Unauthorized: Invalid Jules token.", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	}
+}
+
 var _ ui.UI = &HTMLUserInterface{}
 
 func NewHTMLUserInterface(doc *ui.Document, journal journal.Recorder) (*HTMLUserInterface, error) {
@@ -57,10 +81,27 @@ func NewHTMLUserInterface(doc *ui.Document, journal journal.Recorder) (*HTMLUser
 		journal: journal,
 	}
 
+	// Public routes
 	mux.HandleFunc("GET /", u.serveIndex)
+
+	// Protected routes - apply middleware here
+	// For example, if /doc-stream, /send-message, /choose-option need protection:
+	// mux.HandleFunc("GET /doc-stream", julesAuthMiddleware(u.serveDocStream))
+	// mux.HandleFunc("POST /send-message", julesAuthMiddleware(u.handlePOSTSendMessage))
+	// mux.HandleFunc("POST /choose-option", julesAuthMiddleware(u.handlePOSTChooseOption))
+	// For now, let's assume all routes starting with /protected/ are protected
+	// and we will add a specific protected route as an example later.
+
+	// Original routes (can be adjusted based on which need protection)
 	mux.HandleFunc("GET /doc-stream", u.serveDocStream)
 	mux.HandleFunc("POST /send-message", u.handlePOSTSendMessage)
 	mux.HandleFunc("POST /choose-option", u.handlePOSTChooseOption)
+
+	// Example of a new protected route
+	mux.HandleFunc("GET /protected/data", julesAuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"message": "Access granted to Jules-authenticated user."}`)
+	}))
 
 	httpServerListener, err := net.Listen("tcp", listen)
 	if err != nil {
