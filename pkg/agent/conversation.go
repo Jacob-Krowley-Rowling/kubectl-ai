@@ -22,51 +22,225 @@ import (
 	"html/template"
 	"io"
 	"os"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/gollm"
+	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/journal"
+	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/mcp"
+	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/sandbox"
+	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/sessions"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/tools"
-	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/ui"
+	"github.com/google/uuid"
 	"k8s.io/klog/v2"
 )
 
 //go:embed systemprompt_template_default.txt
 var defaultSystemPromptTemplate string
 
-type Conversation struct {
+type Agent struct {
+	// Input is the channel to receive user input.
+	Input chan any
+
+	// Output is the channel to send messages to the UI.
+	Output chan any
+
+	// RunOnce indicates if the agent should run only once.
+	// If true, the agent will run only once and then exit.
+	// If false, the agent will run in a loop until the context is done.
+	RunOnce bool
+
+	// InitialQuery is the initial query to the agent.
+	// If provided, the agent will run only once and then exit.
+	InitialQuery string
+
+	// tool calls that are pending execution
+	// These will typically be all the tool calls suggested by the LLM in the
+	// previous iteration of the agentic loop.
+	pendingFunctionCalls []ToolCallAnalysis
+
+	// currChatContent tracks chat content that needs to be sent
+	// to the LLM in the current iteration of the agentic loop.
+	currChatContent []any
+
+	// currIteration tracks the current iteration of the agentic loop.
+	currIteration int
+
 	LLM gollm.Client
 
 	// PromptTemplateFile allows specifying a custom template file
 	PromptTemplateFile string
-	Model              string
+	// ExtraPromptPaths allows specifying additional prompt templates
+	// to be combined with PromptTemplateFile
+	ExtraPromptPaths []string
+	Model            string
+	Provider         string
 
 	RemoveWorkDir bool
 
 	MaxIterations int
 
-	Kubeconfig      string
+	// Kubeconfig is the path to the kubeconfig file.
+	Kubeconfig string
+	// Sandbox indicates whether to execute tools in a sandbox environment
+	Sandbox string
+
+	// SandboxImage is the container image to use for the sandbox
+	SandboxImage string
+
 	SkipPermissions bool
 
 	Tools tools.Tools
 
 	EnableToolUseShim bool
 
+	// MCPClientEnabled indicates whether MCP client mode is enabled
+	MCPClientEnabled bool
+
 	// Recorder captures events for diagnostics
 	Recorder journal.Recorder
-
-	// doc is the document which renders the conversation
-	doc *ui.Document
 
 	llmChat gollm.Chat
 
 	workDir string
+
+	// executor is the executor for tool execution
+	executor sandbox.Executor
+
+	// Session optionally provides a session to use.
+	// This is used by the UI to track the state of the agent and the conversation.
+	Session *api.Session
+
+	// protects session from concurrent access
+	sessionMu sync.Mutex
+
+	// cached list of available models
+	availableModels []string
+
+	// mcpManager manages MCP client connections
+	mcpManager *mcp.Manager
+
+	// ChatMessageStore is the underlying session persistence layer.
+	ChatMessageStore api.ChatMessageStore
+
+	// SessionBackend is the configured backend for session persistence (e.g., memory, filesystem).
+	SessionBackend string
+
+	// lastErr is the most recent error run into, for use across the stack
+	lastErr error
 }
 
-func (s *Conversation) Init(ctx context.Context, doc *ui.Document) error {
+// Assert InMemoryChatStore implements ChatMessageStore
+var _ api.ChatMessageStore = &sessions.InMemoryChatStore{}
+
+func (s *Agent) GetSession() *api.Session {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+
+	// Create a shallow copy of the session struct. The Messages slice header
+	// is also copied, providing the caller with a snapshot of the messages
+	// at this point in time. The UI should treat the messages as read-only
+	// to avoid race conditions.
+	sessionCopy := *s.Session
+	return &sessionCopy
+}
+
+// addMessage creates a new message, adds it to the session, and sends it to the output channel
+func (c *Agent) addMessage(source api.MessageSource, messageType api.MessageType, payload any) *api.Message {
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+	message := &api.Message{
+		ID:        uuid.New().String(),
+		Source:    source,
+		Type:      messageType,
+		Payload:   payload,
+		Timestamp: time.Now(),
+	}
+
+	// session should always have a ChatMessageStore at this point
+	c.Session.ChatMessageStore.AddChatMessage(message)
+	c.Session.LastModified = time.Now()
+	c.Output <- message
+	return message
+}
+
+// setAgentState updates the agent state and ensures LastModified is updated
+func (c *Agent) setAgentState(newState api.AgentState) {
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+	currentState := c.agentState()
+	if currentState != newState {
+		klog.Infof("Agent state changing from %s to %s", currentState, newState)
+		c.Session.AgentState = newState
+		c.Session.LastModified = time.Now()
+	}
+}
+
+func (c *Agent) AgentState() api.AgentState {
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+	return c.agentState()
+}
+
+// agentState returns the agent state without locking.
+// The caller is responsible for locking.
+func (c *Agent) agentState() api.AgentState {
+	return c.Session.AgentState
+}
+
+func (s *Agent) Init(ctx context.Context) error {
 	log := klog.FromContext(ctx)
+
+	s.Input = make(chan any, 10)
+	s.Output = make(chan any, 10)
+	s.currIteration = 0
+	// when we support session, we will need to initialize this with the
+	// current history of the conversation.
+	s.currChatContent = []any{}
+
+	if s.InitialQuery == "" && s.RunOnce {
+		return fmt.Errorf("RunOnce mode requires an initial query to be provided")
+	}
+
+	if s.SessionBackend == "" {
+		s.SessionBackend = "memory"
+	}
+
+	if s.Session != nil {
+		if s.Session.ChatMessageStore == nil {
+			s.Session.ChatMessageStore = sessions.NewInMemoryChatStore()
+		}
+		s.ChatMessageStore = s.Session.ChatMessageStore
+		if s.Session.ID == "" {
+			s.Session.ID = uuid.New().String()
+		}
+		if s.Session.CreatedAt.IsZero() {
+			s.Session.CreatedAt = time.Now()
+		}
+		if s.Session.LastModified.IsZero() {
+			s.Session.LastModified = time.Now()
+		}
+		s.Session.Messages = s.Session.ChatMessageStore.ChatMessages()
+	} else {
+		if s.ChatMessageStore == nil {
+			s.ChatMessageStore = sessions.NewInMemoryChatStore()
+		}
+
+		s.Session = &api.Session{
+			ID:               uuid.New().String(),
+			ProviderID:       s.Provider,
+			ModelID:          s.Model,
+			Messages:         s.ChatMessageStore.ChatMessages(),
+			AgentState:       api.AgentStateIdle,
+			ChatMessageStore: s.ChatMessageStore,
+			CreatedAt:        time.Now(),
+			LastModified:     time.Now(),
+		}
+	}
 
 	// Create a temporary working directory
 	workDir, err := os.MkdirTemp("", "agent-workdir-*")
@@ -77,9 +251,61 @@ func (s *Conversation) Init(ctx context.Context, doc *ui.Document) error {
 
 	log.Info("Created temporary working directory", "workDir", workDir)
 
+	switch s.Sandbox {
+	case "k8s":
+		sandboxName := fmt.Sprintf("kubectl-ai-sandbox-%s", uuid.New().String()[:8])
+
+		// Use default image if not specified
+		sandboxImage := s.SandboxImage
+		if sandboxImage == "" {
+			sandboxImage = "bitnami/kubectl:latest"
+		}
+
+		// Create sandbox with kubeconfig
+		sb, err := sandbox.NewKubernetesSandbox(sandboxName,
+			sandbox.WithKubeconfig(s.Kubeconfig),
+			sandbox.WithImage(sandboxImage),
+		)
+		if err != nil {
+			return fmt.Errorf("failed to create sandbox: %w", err)
+		}
+
+		s.executor = sb
+		log.Info("Created sandbox", "name", sandboxName, "image", sandboxImage)
+
+	case "seatbelt":
+		if runtime.GOOS != "darwin" {
+			return fmt.Errorf("seatbelt sandbox is only supported on macOS")
+		}
+		s.executor = sandbox.NewSeatbeltExecutor()
+		log.Info("Using Seatbelt executor")
+
+	case "":
+		// No sandbox, use local executor
+		s.executor = sandbox.NewLocalExecutor()
+
+	default:
+		return fmt.Errorf("unknown sandbox type: %s", s.Sandbox)
+	}
+
+	s.workDir = workDir
+
+	// Register tools with executor if none registered yet
+	// We need to preserve existing tools (e.g. custom tools) while ensuring we have a fresh map
+	// for this agent instance to avoid polluting the global default tools.
+	existingTools := s.Tools.AllTools()
+	s.Tools.Init()
+	for _, tool := range existingTools {
+		s.Tools.RegisterTool(tool)
+	}
+	s.Tools.RegisterTool(tools.NewBashTool(s.executor))
+	s.Tools.RegisterTool(tools.NewKubectlTool(s.executor))
+
 	systemPrompt, err := s.generatePrompt(ctx, defaultSystemPromptTemplate, PromptData{
 		Tools:             s.Tools,
 		EnableToolUseShim: s.EnableToolUseShim,
+		// RunOnce is a good proxy to indicate the agentic session is non-interactive mode.
+		SessionIsInteractive: !s.RunOnce,
 	})
 	if err != nil {
 		return fmt.Errorf("generating system prompt: %w", err)
@@ -96,6 +322,22 @@ func (s *Conversation) Init(ctx context.Context, doc *ui.Document) error {
 			Jitter:         true,
 		},
 	)
+	err = s.llmChat.Initialize(s.Session.ChatMessageStore.ChatMessages())
+	if err != nil {
+		return fmt.Errorf("initializing chat session: %w", err)
+	}
+
+	if s.MCPClientEnabled {
+		if err := s.InitializeMCPClient(ctx); err != nil {
+			klog.Errorf("Failed to initialize MCP client: %v", err)
+			return fmt.Errorf("failed to initialize MCP client: %w", err)
+		}
+
+		// Update MCP status in session
+		if err := s.UpdateMCPStatus(ctx, s.MCPClientEnabled); err != nil {
+			klog.Warningf("Failed to update MCP status: %v", err)
+		}
+	}
 
 	if !s.EnableToolUseShim {
 		var functionDefinitions []*gollm.FunctionDefinition
@@ -110,13 +352,11 @@ func (s *Conversation) Init(ctx context.Context, doc *ui.Document) error {
 			return fmt.Errorf("setting function definitions: %w", err)
 		}
 	}
-	s.workDir = workDir
-	s.doc = doc
 
 	return nil
 }
 
-func (c *Conversation) Close() error {
+func (c *Agent) Close() error {
 	if c.workDir != "" {
 		if c.RemoveWorkDir {
 			if err := os.RemoveAll(c.workDir); err != nil {
@@ -124,209 +364,739 @@ func (c *Conversation) Close() error {
 			}
 		}
 	}
+	// Close MCP client connections
+	if err := c.CloseMCPClient(); err != nil {
+		klog.Warningf("error closing MCP client: %v", err)
+	}
+
+	// Close sandbox if enabled
+	// Close executor if it exists
+	if c.executor != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := c.executor.Close(ctx); err != nil {
+			klog.Warningf("error cleaning up executor: %v", err)
+		} else {
+			klog.Info("Executor cleaned up successfully")
+		}
+	}
 	return nil
 }
 
-// RunOneRound executes a chat-based agentic loop with the LLM using function calling.
-func (a *Conversation) RunOneRound(ctx context.Context, query string) error {
+func (c *Agent) LastErr() error {
+	return c.lastErr
+}
+
+func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 	log := klog.FromContext(ctx)
-	log.Info("Starting chat loop for query:", "query", query)
 
-	// currChatContent tracks chat content that needs to be sent
-	// to the LLM in each iteration of  the agentic loop below
-	var currChatContent []any
+	if c.Recorder != nil {
+		ctx = journal.ContextWithRecorder(ctx, c.Recorder)
+	}
 
-	// Set the initial message to start the conversation
-	currChatContent = []any{query}
+	// Save unexpected error and return it in for RunOnce mode
+	log.Info("Starting agent loop", "initialQuery", initialQuery, "runOnce", c.RunOnce)
+	go func() {
+		if initialQuery != "" {
+			c.addMessage(api.MessageSourceUser, api.MessageTypeText, initialQuery)
+			answer, handled, err := c.handleMetaQuery(ctx, initialQuery)
+			if err != nil {
+				log.Error(err, "error handling meta query")
+				c.setAgentState(api.AgentStateDone)
+				c.pendingFunctionCalls = []ToolCallAnalysis{}
+				c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
+			} else if handled {
+				// initialQuery is the 'exit' or 'quit' metaquery
+				if c.AgentState() == api.AgentStateExited {
+					c.addMessage(api.MessageSourceAgent, api.MessageTypeText, answer)
+					close(c.Output)
+					return
+				}
+				// we handled the meta query, so we don't need to run the agentic loop
+				c.setAgentState(api.AgentStateDone)
+				c.pendingFunctionCalls = []ToolCallAnalysis{}
+				c.addMessage(api.MessageSourceAgent, api.MessageTypeText, answer)
+			} else {
+				// Start the agentic loop with the initial query
+				c.setAgentState(api.AgentStateRunning)
+				c.currIteration = 0
+				c.currChatContent = []any{initialQuery}
+				c.pendingFunctionCalls = []ToolCallAnalysis{}
+			}
+		} else {
+			if len(c.Session.Messages) > 0 {
+				// Resuming existing session
+				greetingMessage := fmt.Sprintf("Welcome back. What can I help you with today?\n (Don't want to continue your last session? Use --new-session)\n\n%s", c.Session.String())
+				c.addMessage(api.MessageSourceAgent, api.MessageTypeText, greetingMessage)
+			} else {
+				// Starting new session
+				greetingMessage := fmt.Sprintf("Hey there, what can I help you with today?\n\n%s", c.Session.String())
+				c.addMessage(api.MessageSourceAgent, api.MessageTypeText, greetingMessage)
+			}
+		}
+		c.lastErr = nil
+		for {
+			var userInput any
+			log.Info("Agent loop iteration", "state", c.AgentState())
+			switch c.AgentState() {
+			case api.AgentStateIdle, api.AgentStateDone:
+				// In RunOnce mode, we are done, so exit
+				if c.RunOnce {
+					log.Info("RunOnce mode, exiting agent loop")
+					c.setAgentState(api.AgentStateExited)
+					return
+				}
+				log.Info("initiating user input")
+				c.addMessage(api.MessageSourceAgent, api.MessageTypeUserInputRequest, ">>>")
+				select {
+				case <-ctx.Done():
+					log.Info("Agent loop done")
+					return
+				case userInput = <-c.Input:
+					log.Info("Received input from channel", "userInput", userInput)
+					if userInput == io.EOF {
+						log.Info("Agent loop done, EOF received")
+						c.setAgentState(api.AgentStateExited)
+						c.addMessage(api.MessageSourceAgent, api.MessageTypeText, "It has been a pleasure assisting you. Have a great day!")
+						return
+					}
+					query, ok := userInput.(*api.UserInputResponse)
+					if !ok {
+						log.Error(nil, "Received unexpected input from channel", "userInput", userInput)
+						return
+					}
+					if strings.TrimSpace(query.Query) == "" {
+						log.Info("No query provided, skipping agentic loop")
+						continue
+					}
+					c.addMessage(api.MessageSourceUser, api.MessageTypeText, query.Query)
+					// we don't need the agentic loop for meta queries
+					// for ex. model, tools, etc.
+					answer, handled, err := c.handleMetaQuery(ctx, query.Query)
+					if err != nil {
+						log.Error(err, "error handling meta query")
+						c.setAgentState(api.AgentStateDone)
+						c.pendingFunctionCalls = []ToolCallAnalysis{}
+						c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
+						continue
+					}
+					if handled {
+						// metaquery set the state to 'Exited', so we should exit
+						if c.AgentState() == api.AgentStateExited {
+							c.addMessage(api.MessageSourceAgent, api.MessageTypeText, answer)
+							close(c.Output)
+							return
+						}
+						// we handled the meta query, so we don't need to run the agentic loop
+						c.setAgentState(api.AgentStateDone)
+						c.pendingFunctionCalls = []ToolCallAnalysis{}
+						c.addMessage(api.MessageSourceAgent, api.MessageTypeText, answer)
+						continue
+					}
 
-	currentIteration := 0
-	maxIterations := a.MaxIterations
+					c.setAgentState(api.AgentStateRunning)
+					c.currIteration = 0
+					c.currChatContent = []any{query.Query}
+					c.pendingFunctionCalls = []ToolCallAnalysis{}
+					log.Info("Set agent state to running, will process agentic loop", "currIteration", c.currIteration, "currChatContent", len(c.currChatContent))
+				}
+			case api.AgentStateWaitingForInput:
+				// In RunOnce mode, if we need user choice, exit with error
+				if c.RunOnce {
+					log.Error(nil, "RunOnce mode cannot handle user choice requests")
+					c.setAgentState(api.AgentStateExited)
+					c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: RunOnce mode cannot handle user choice requests")
+					return
+				}
+				select {
+				case <-ctx.Done():
+					log.Info("Agent loop done")
+					return
+				case userInput = <-c.Input:
+					if userInput == io.EOF {
+						log.Info("Agent loop done, EOF received")
+						c.setAgentState(api.AgentStateExited)
+						c.addMessage(api.MessageSourceAgent, api.MessageTypeText, "It has been a pleasure assisting you. Have a great day!")
+						return
+					}
+					choiceResponse, ok := userInput.(*api.UserChoiceResponse)
+					if !ok {
+						log.Error(nil, "Received unexpected input from channel", "userInput", userInput)
+						return
+					}
+					dispatchToolCalls := c.handleChoice(ctx, choiceResponse)
+					if dispatchToolCalls {
+						if err := c.DispatchToolCalls(ctx); err != nil {
+							log.Error(err, "error dispatching tool calls")
+							c.setAgentState(api.AgentStateDone)
+							c.pendingFunctionCalls = []ToolCallAnalysis{}
+							c.Session.LastModified = time.Now()
+							c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
+							// In RunOnce mode, exit on tool execution error
+							if c.RunOnce {
+								c.setAgentState(api.AgentStateExited)
+								c.lastErr = err
+								return
+							}
+							continue
+						}
+						// Clear pending function calls after execution
+						c.pendingFunctionCalls = []ToolCallAnalysis{}
+						c.setAgentState(api.AgentStateRunning)
+						c.currIteration = c.currIteration + 1
+					} else {
+						// if user has declined, we are done with this iteration
+						c.currIteration = c.currIteration + 1
+						c.pendingFunctionCalls = []ToolCallAnalysis{}
+						c.setAgentState(api.AgentStateRunning)
+						c.Session.LastModified = time.Now()
+					}
+				}
+			case api.AgentStateRunning:
+				// Agent is running, don't wait for input, just continue to process the agentic loop
+				log.Info("Agent is in running state, processing agentic loop")
+			case api.AgentStateExited:
+				log.Info("Agent exited in RunOnce mode")
+				return
+			}
 
-	for currentIteration < maxIterations {
-		log.Info("Starting iteration", "iteration", currentIteration)
+			if c.AgentState() == api.AgentStateRunning {
+				log.Info("Processing agentic loop", "currIteration", c.currIteration, "maxIterations", c.MaxIterations, "currChatContentLen", len(c.currChatContent))
 
-		a.Recorder.Write(ctx, &journal.Event{
-			Timestamp: time.Now(),
-			Action:    "llm-chat",
-			Payload:   []any{currChatContent},
+				if c.currIteration >= c.MaxIterations {
+					c.setAgentState(api.AgentStateDone)
+					c.pendingFunctionCalls = []ToolCallAnalysis{}
+					c.addMessage(api.MessageSourceAgent, api.MessageTypeText, "Maximum number of iterations reached.")
+					continue
+				}
+
+				// we run the agentic loop for one iteration
+				stream, err := c.llmChat.SendStreaming(ctx, c.currChatContent...)
+				if err != nil {
+					log.Error(err, "error sending streaming LLM response")
+					c.setAgentState(api.AgentStateDone)
+					c.pendingFunctionCalls = []ToolCallAnalysis{}
+					c.lastErr = err
+					continue
+				}
+
+				// Clear our "response" now that we sent the last response
+				c.currChatContent = nil
+
+				if c.EnableToolUseShim {
+					// convert the candidate response into a gollm.ChatResponse
+					stream, err = candidateToShimCandidate(stream)
+					if err != nil {
+						c.setAgentState(api.AgentStateDone)
+						c.pendingFunctionCalls = []ToolCallAnalysis{}
+
+						// In RunOnce mode, exit on shim conversion error
+						if c.RunOnce {
+							c.setAgentState(api.AgentStateExited)
+							return
+						}
+
+						continue
+					}
+				}
+				// Process each part of the response
+				var functionCalls []gollm.FunctionCall
+
+				// accumulator for streamed text
+				var streamedText string
+				var llmError error
+
+				for response, err := range stream {
+					if err != nil {
+						log.Error(err, "error reading streaming LLM response")
+						llmError = err
+						c.setAgentState(api.AgentStateDone)
+						c.pendingFunctionCalls = []ToolCallAnalysis{}
+						c.lastErr = llmError
+						break
+					}
+					if response == nil {
+						// end of streaming response
+						break
+					}
+					// klog.Infof("response: %+v", response)
+
+					if len(response.Candidates()) == 0 {
+						llmError = fmt.Errorf("no candidates in response")
+						log.Error(nil, "No candidates in response")
+						c.setAgentState(api.AgentStateDone)
+						c.pendingFunctionCalls = []ToolCallAnalysis{}
+						break
+					}
+
+					candidate := response.Candidates()[0]
+
+					for _, part := range candidate.Parts() {
+						// Check if it's a text response
+						if text, ok := part.AsText(); ok {
+							log.Info("text response", "text", text)
+							streamedText += text
+						}
+
+						// Check if it's a function call
+						if calls, ok := part.AsFunctionCalls(); ok && len(calls) > 0 {
+							log.Info("function calls", "calls", calls)
+							functionCalls = append(functionCalls, calls...)
+						}
+					}
+				}
+				if llmError != nil {
+					log.Error(llmError, "error streaming LLM response")
+					c.setAgentState(api.AgentStateDone)
+					c.pendingFunctionCalls = []ToolCallAnalysis{}
+					c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+llmError.Error())
+					c.lastErr = llmError
+					continue
+				}
+				log.Info("streamedText", "streamedText", streamedText)
+
+				if streamedText != "" {
+					c.addMessage(api.MessageSourceModel, api.MessageTypeText, streamedText)
+				}
+				// If no function calls to be made, we're done
+				if len(functionCalls) == 0 {
+					log.Info("No function calls to be made, so most likely the task is completed, so we're done.")
+					c.setAgentState(api.AgentStateDone)
+					c.currChatContent = []any{}
+					c.currIteration = 0
+					c.pendingFunctionCalls = []ToolCallAnalysis{}
+					log.Info("Agent task completed, transitioning to done state")
+					if streamedText == "" {
+						// If no tool calls to be made and we do not have a response from the LLM
+						// we should let the user know for better diagnostics.
+						// IMPORTANT: This also prevents UIs from getting blocked on reading from the output channel.
+						log.Info("Empty response with no tool calls from LLM.")
+						c.addMessage(api.MessageSourceAgent, api.MessageTypeText, "Empty response from LLM")
+					}
+					continue
+				}
+
+				toolCallAnalysisResults, err := c.analyzeToolCalls(ctx, functionCalls)
+				if err != nil {
+					log.Error(err, "error analyzing tool calls")
+					c.setAgentState(api.AgentStateDone)
+					c.pendingFunctionCalls = []ToolCallAnalysis{}
+					c.Session.LastModified = time.Now()
+					c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
+					c.lastErr = err
+					continue
+				}
+
+				// mark the tools for dispatching
+				c.pendingFunctionCalls = toolCallAnalysisResults
+
+				interactiveToolCallIndex := -1
+				modifiesResourceToolCallIndex := -1
+				for i, result := range toolCallAnalysisResults {
+					if result.ModifiesResourceStr != "no" {
+						modifiesResourceToolCallIndex = i
+					}
+					if result.IsInteractive {
+						interactiveToolCallIndex = i
+					}
+				}
+
+				if interactiveToolCallIndex >= 0 {
+					// Show error block for both shim enabled and disabled modes
+					errorMessage := fmt.Sprintf("  %s\n", toolCallAnalysisResults[interactiveToolCallIndex].IsInteractiveError.Error())
+					c.addMessage(api.MessageSourceAgent, api.MessageTypeError, errorMessage)
+
+					if c.EnableToolUseShim {
+						// Add the error as an observation
+						observation := fmt.Sprintf("Result of running %q:\n%v",
+							toolCallAnalysisResults[interactiveToolCallIndex].FunctionCall.Name,
+							toolCallAnalysisResults[interactiveToolCallIndex].IsInteractiveError.Error())
+						c.currChatContent = append(c.currChatContent, observation)
+					} else {
+						// For models with tool-use support (shim disabled), use proper FunctionCallResult
+						// Note: This assumes the model supports sending FunctionCallResult
+						c.currChatContent = append(c.currChatContent, gollm.FunctionCallResult{
+							ID:     toolCallAnalysisResults[interactiveToolCallIndex].FunctionCall.ID,
+							Name:   toolCallAnalysisResults[interactiveToolCallIndex].FunctionCall.Name,
+							Result: map[string]any{"error": toolCallAnalysisResults[interactiveToolCallIndex].IsInteractiveError.Error()},
+						})
+					}
+					c.pendingFunctionCalls = []ToolCallAnalysis{} // reset pending function calls
+					c.currIteration = c.currIteration + 1
+					continue // Skip execution for interactive commands
+				}
+
+				if !c.SkipPermissions && modifiesResourceToolCallIndex >= 0 {
+					// In RunOnce mode, exit with error if permission is required
+					if c.RunOnce {
+						var commandDescriptions []string
+						for _, call := range c.pendingFunctionCalls {
+							commandDescriptions = append(commandDescriptions, call.ParsedToolCall.Description())
+						}
+						errorMessage := "RunOnce mode cannot handle permission requests. The following commands require approval:\n* " + strings.Join(commandDescriptions, "\n* ")
+						errorMessage += "\nUse --skip-permissions flag to bypass permission checks in RunOnce mode."
+
+						log.Error(nil, "RunOnce mode cannot handle permission requests", "commands", commandDescriptions)
+						c.setAgentState(api.AgentStateExited)
+						c.addMessage(api.MessageSourceAgent, api.MessageTypeError, errorMessage)
+						c.lastErr = fmt.Errorf("%s", errorMessage)
+						return
+					}
+
+					var commandDescriptions []string
+					for _, call := range c.pendingFunctionCalls {
+						commandDescriptions = append(commandDescriptions, call.ParsedToolCall.Description())
+					}
+					confirmationPrompt := "The following commands require your approval to run:\n* " + strings.Join(commandDescriptions, "\n* ")
+					confirmationPrompt += "\n\nDo you want to proceed ?"
+
+					choiceRequest := &api.UserChoiceRequest{
+						Prompt: confirmationPrompt,
+						Options: []api.UserChoiceOption{
+							{Value: "yes", Label: "Yes"},
+							{Value: "yes_and_dont_ask_me_again", Label: "Yes, and don't ask me again"},
+							{Value: "no", Label: "No"},
+						},
+					}
+					c.setAgentState(api.AgentStateWaitingForInput)
+					c.addMessage(api.MessageSourceAgent, api.MessageTypeUserChoiceRequest, choiceRequest)
+					// Request input from the user by sending a message on the output channel.
+					// Remaining part of the loop will be now resumed when we receive a choice input
+					// from the user.
+					continue
+				}
+
+				// we are here means we are in the clear to dispatch the tool calls
+				if err := c.DispatchToolCalls(ctx); err != nil {
+					log.Error(err, "error dispatching tool calls")
+					c.setAgentState(api.AgentStateDone)
+					c.pendingFunctionCalls = []ToolCallAnalysis{}
+					c.Session.LastModified = time.Now()
+					c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
+					c.lastErr = err
+					continue
+				}
+				c.currIteration = c.currIteration + 1
+				c.pendingFunctionCalls = []ToolCallAnalysis{}
+				log.Info("Tool calls dispatched successfully", "currIteration", c.currIteration, "currChatContentLen", len(c.currChatContent), "agentState", c.AgentState())
+			}
+		}
+	}()
+
+	return nil
+}
+
+func (c *Agent) handleMetaQuery(ctx context.Context, query string) (answer string, handled bool, err error) {
+	switch query {
+	case "clear", "reset":
+		c.sessionMu.Lock()
+		// TODO: Remove this check when session persistence is default
+		if err := c.Session.ChatMessageStore.ClearChatMessages(); err != nil {
+			return "Failed to clear the conversation", false, err
+		}
+		c.llmChat.Initialize(c.Session.ChatMessageStore.ChatMessages())
+		c.sessionMu.Unlock()
+		return "Cleared the conversation.", true, nil
+	case "exit", "quit":
+		c.setAgentState(api.AgentStateExited)
+		return "It has been a pleasure assisting you. Have a great day!", true, nil
+	case "model":
+		return "Current model is `" + c.Model + "`", true, nil
+	case "models":
+		models, err := c.listModels(ctx)
+		if err != nil {
+			return "", false, fmt.Errorf("listing models: %w", err)
+		}
+		return "Available models:\n\n  - " + strings.Join(models, "\n  - ") + "\n\n", true, nil
+	case "tools":
+		return "Available tools:\n\n  - " + strings.Join(c.Tools.Names(), "\n  - ") + "\n\n", true, nil
+	case "session":
+		return c.Session.String(), true, nil
+
+	case "save-session":
+		savedSessionID, err := c.SaveSession()
+		if err != nil {
+			return "", false, fmt.Errorf("failed to save session: %w", err)
+		}
+		return "Saved session as " + savedSessionID, true, nil
+
+	case "sessions":
+		manager, err := sessions.NewSessionManager(c.SessionBackend)
+		if err != nil {
+			return "", false, fmt.Errorf("failed to create session manager: %w", err)
+		}
+
+		sessionList, err := manager.ListSessions()
+		if err != nil {
+			return "", false, fmt.Errorf("failed to list sessions: %w", err)
+		}
+		if len(sessionList) == 0 {
+			return "No sessions found.", true, nil
+		}
+
+		// Add ```text so markdown doesn't wreck the format
+		availableSessions := "```text"
+		availableSessions += "Available sessions:\n\n"
+		availableSessions += "ID\t\t\tCreated\t\t\tLast Accessed\t\tModel\t\tProvider\n"
+		availableSessions += "--\t\t\t-------\t\t\t-------------\t\t-----\t\t--------\n"
+
+		for _, session := range sessionList {
+			availableSessions += fmt.Sprintf("%s\t%s\t%s\t%s\t%s\n",
+				session.ID,
+				session.CreatedAt.Format("2006-01-02 15:04"),
+				session.LastModified.Format("2006-01-02 15:04"),
+				session.ModelID,
+				session.ProviderID)
+		}
+		// close the ```text box
+		availableSessions += "```"
+		return availableSessions, true, nil
+	}
+
+	if strings.HasPrefix(query, "resume-session") {
+		parts := strings.Split(query, " ")
+		if len(parts) != 2 {
+			return "Invalid command. Usage: resume-session <session_id>", true, nil
+		}
+		sessionID := parts[1]
+		if err := c.loadSession(sessionID); err != nil {
+			return "", false, err
+		}
+		return fmt.Sprintf("Resumed session %s.", sessionID), true, nil
+	}
+
+	return "", false, nil
+}
+
+func (c *Agent) SaveSession() (string, error) {
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+
+	manager, err := sessions.NewSessionManager(c.SessionBackend)
+	if err != nil {
+		return "", fmt.Errorf("failed to create session manager: %w", err)
+	}
+	if c.Session != nil {
+		foundSession, _ := manager.FindSessionByID(c.Session.ID)
+		if foundSession != nil {
+			return foundSession.ID, nil
+		}
+	}
+
+	metadata := sessions.Metadata{
+		CreatedAt:    c.Session.CreatedAt,
+		LastAccessed: time.Now(),
+		ModelID:      c.Model,
+		ProviderID:   c.Provider,
+	}
+
+	newSession, err := manager.NewSession(metadata)
+	if err != nil {
+		return "", fmt.Errorf("failed to create new session: %w", err)
+	}
+
+	messages := c.ChatMessageStore.ChatMessages()
+	if err := newSession.ChatMessageStore.SetChatMessages(messages); err != nil {
+		return "", fmt.Errorf("failed to save chat messages to new session: %w", err)
+	}
+
+	c.ChatMessageStore = newSession.ChatMessageStore
+	c.Session = newSession
+	c.Session.Messages = messages
+
+	if c.llmChat != nil {
+		_ = c.llmChat.Initialize(c.Session.ChatMessageStore.ChatMessages())
+	}
+
+	return newSession.ID, nil
+}
+
+// loadSession loads a session by ID (or latest), updates the agent's state, and re-initializes the chat.
+func (c *Agent) loadSession(sessionID string) error {
+	manager, err := sessions.NewSessionManager(c.SessionBackend)
+	if err != nil {
+		return fmt.Errorf("failed to create session manager: %w", err)
+	}
+
+	var session *api.Session
+	if sessionID == "" || sessionID == "latest" {
+		s, err := manager.GetLatestSession()
+		if err != nil {
+			return fmt.Errorf("failed to get latest session: %w", err)
+		}
+		if s == nil {
+			// This can happen if GetLatestSession returns nil, nil (no sessions exist)
+			return fmt.Errorf("no sessions found to resume")
+		}
+		session = s
+	} else {
+		s, err := manager.FindSessionByID(sessionID)
+		if err != nil {
+			return fmt.Errorf("failed to get session %q: %w", sessionID, err)
+		}
+		session = s
+	}
+
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+
+	if session.ChatMessageStore == nil {
+		session.ChatMessageStore = sessions.NewInMemoryChatStore()
+	}
+
+	c.Session = session
+	c.ChatMessageStore = session.ChatMessageStore
+	c.Session.Messages = session.ChatMessageStore.ChatMessages()
+	c.Session.LastModified = time.Now()
+
+	if err := manager.UpdateLastAccessed(session); err != nil {
+		return fmt.Errorf("failed to update session metadata: %w", err)
+	}
+
+	if c.llmChat != nil {
+		if err := c.llmChat.Initialize(c.Session.ChatMessageStore.ChatMessages()); err != nil {
+			return fmt.Errorf("failed to re-initialize chat with new session: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (c *Agent) listModels(ctx context.Context) ([]string, error) {
+	if c.availableModels == nil {
+		modelNames, err := c.LLM.ListModels(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("listing models: %w", err)
+		}
+		c.availableModels = modelNames
+	}
+	return c.availableModels, nil
+}
+
+func (c *Agent) DispatchToolCalls(ctx context.Context) error {
+	log := klog.FromContext(ctx)
+	// execute all pending function calls
+	for _, call := range c.pendingFunctionCalls {
+		// Only show "Running" message and proceed with execution for non-interactive commands
+		toolDescription := call.ParsedToolCall.Description()
+
+		c.addMessage(api.MessageSourceModel, api.MessageTypeToolCallRequest, toolDescription)
+
+		output, err := call.ParsedToolCall.InvokeTool(ctx, tools.InvokeToolOptions{
+			Kubeconfig: c.Kubeconfig,
+			WorkDir:    c.workDir,
+			Executor:   c.executor,
 		})
 
-		stream, err := a.llmChat.SendStreaming(ctx, currChatContent...)
 		if err != nil {
+			log.Error(err, "error executing action", "output", output)
+			c.addMessage(api.MessageSourceAgent, api.MessageTypeToolCallResponse, err.Error())
 			return err
 		}
 
-		// Clear our "response" now that we sent the last response
-		currChatContent = nil
-
-		if a.EnableToolUseShim {
-			// convert the candidate response into a gollm.ChatResponse
-			stream, err = candidateToShimCandidate(stream)
+		// Handle timeout message using UI blocks
+		if execResult, ok := output.(*sandbox.ExecResult); ok && execResult != nil && execResult.StreamType == "timeout" {
+			c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "\nTimeout reached after 7 seconds\n")
+		}
+		// Add the tool call result to maintain conversation flow
+		var payload any
+		if c.EnableToolUseShim {
+			// Add the error as an observation
+			observation := fmt.Sprintf("Result of running %q:\n%v",
+				call.FunctionCall.Name,
+				output)
+			c.currChatContent = append(c.currChatContent, observation)
+			payload = observation
+		} else {
+			// If shim is disabled, convert the result to a map and append FunctionCallResult
+			result, err := tools.ToolResultToMap(output)
 			if err != nil {
+				log.Error(err, "error converting tool result to map", "output", output)
 				return err
 			}
-		}
-
-		// Process each part of the response
-		// only applicable is not using tooluse shim
-		var functionCalls []gollm.FunctionCall
-
-		var agentTextBlock *ui.AgentTextBlock
-
-		for response, err := range stream {
-			if err != nil {
-				return fmt.Errorf("reading streaming LLM response: %w", err)
-			}
-			if response == nil {
-				// end of streaming response
-				break
-			}
-			klog.Infof("response: %+v", response)
-			a.Recorder.Write(ctx, &journal.Event{
-				Timestamp: time.Now(),
-				Action:    "llm-response",
-				Payload:   response,
+			payload = result
+			c.currChatContent = append(c.currChatContent, gollm.FunctionCallResult{
+				ID:     call.FunctionCall.ID,
+				Name:   call.FunctionCall.Name,
+				Result: result,
 			})
-
-			if len(response.Candidates()) == 0 {
-				log.Error(nil, "No candidates in response")
-				return fmt.Errorf("no candidates in LLM response")
-			}
-
-			candidate := response.Candidates()[0]
-
-			for _, part := range candidate.Parts() {
-				// Check if it's a text response
-				if text, ok := part.AsText(); ok {
-					log.Info("text response", "text", text)
-					if agentTextBlock == nil {
-						agentTextBlock = ui.NewAgentTextBlock()
-						agentTextBlock.SetStreaming(true)
-						a.doc.AddBlock(agentTextBlock)
-					}
-					agentTextBlock.AppendText(text)
-				}
-
-				// Check if it's a function call
-				if calls, ok := part.AsFunctionCalls(); ok && len(calls) > 0 {
-					log.Info("function calls", "calls", calls)
-					functionCalls = append(functionCalls, calls...)
-				}
-			}
 		}
-
-		if agentTextBlock != nil {
-			agentTextBlock.SetStreaming(false)
-		}
-
-		// TODO(droot): Run all function calls in parallel
-		// (may have to specify in the prompt to make these function calls independent)
-		for _, call := range functionCalls {
-			toolCall, err := a.Tools.ParseToolInvocation(ctx, call.Name, call.Arguments)
-			if err != nil {
-				return fmt.Errorf("building tool call: %w", err)
-			}
-
-			s := toolCall.PrettyPrint()
-			a.doc.AddBlock(ui.NewFunctionCallRequestBlock().SetText(fmt.Sprintf("  Running: %s\n", s)))
-			// Ask for confirmation only if SkipPermissions is false AND the tool modifies resources.
-			if !a.SkipPermissions && call.Arguments["modifies_resource"] != "no" {
-				confirmationPrompt := `  Do you want to proceed ?
-  1) Yes
-  2) Yes, and don't ask me again
-  3) No`
-
-				optionsBlock := ui.NewInputOptionBlock().SetPrompt(confirmationPrompt)
-				optionsBlock.SetOptions([]string{"1", "2", "3"})
-				a.doc.AddBlock(optionsBlock)
-
-				selectedChoice, err := optionsBlock.Observable().Wait()
-				if err != nil {
-					if err == io.EOF {
-						// Use hit control-D, or was piping and we reached the end of stdin.
-						// Not a "big" problem
-						return nil
-					}
-					return fmt.Errorf("reading input: %w", err)
-				}
-
-				switch selectedChoice {
-				case "1":
-					// Proceed with the operation
-				case "2":
-					a.SkipPermissions = true
-				case "3":
-					a.doc.AddBlock(ui.NewAgentTextBlock().SetText("Operation was skipped."))
-					observation := fmt.Sprintf("User didn't approve running %q.\n", call.Name)
-					currChatContent = append(currChatContent, observation)
-					continue
-				default:
-					// This case should technically not be reachable due to AskForConfirmation loop
-					err := fmt.Errorf("invalid confirmation choice: %q", selectedChoice)
-					log.Error(err, "Invalid choice received from AskForConfirmation")
-					a.doc.AddBlock(ui.NewErrorBlock().SetText("Invalid choice received. Cancelling operation."))
-					return err
-				}
-			}
-
-			ctx := journal.ContextWithRecorder(ctx, a.Recorder)
-			output, err := toolCall.InvokeTool(ctx, tools.InvokeToolOptions{
-				Kubeconfig: a.Kubeconfig,
-				WorkDir:    a.workDir,
-			})
-			if err != nil {
-				return fmt.Errorf("executing action: %w", err)
-			}
-
-			if a.EnableToolUseShim {
-				observation := fmt.Sprintf("Result of running %q:\n%s", call.Name, output)
-				currChatContent = append(currChatContent, observation)
-			} else {
-				result, err := tools.ToolResultToMap(output)
-				if err != nil {
-					return err
-				}
-
-				currChatContent = append(currChatContent, gollm.FunctionCallResult{
-					ID:     call.ID,
-					Name:   call.Name,
-					Result: result,
-				})
-			}
-		}
-
-		// If no function calls were made, we're done
-		if len(functionCalls) == 0 {
-			log.Info("No function calls were made, so most likely the task is completed, so we're done.")
-			return nil
-		}
-
-		currentIteration++
+		c.addMessage(api.MessageSourceAgent, api.MessageTypeToolCallResponse, payload)
 	}
-
-	// If we've reached the maximum number of iterations
-	log.Info("Max iterations reached", "iterations", maxIterations)
-	errorBlock := ui.NewErrorBlock().SetText(fmt.Sprintf("Sorry, couldn't complete the task after %d iterations.\n", maxIterations))
-	a.doc.AddBlock(errorBlock)
-	return fmt.Errorf("max iterations reached")
+	return nil
 }
 
-// toResult converts an arbitrary result to a map[string]any
-func toResult(v any) (map[string]any, error) {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return nil, fmt.Errorf("converting result to json: %w", err)
-	}
+// The key idea is to treat all tool calls to be executed atomically or not
+// If all tool calls are readonly call, it is straight forward
+// if some of the tool calls are not readonly, then the interesting question is should the permission
+// be asked for each of the tool call or only once for all the tool calls.
+// I think treating all tool calls as atomic is the right thing to do.
 
-	m := make(map[string]any)
-	if err := json.Unmarshal(b, &m); err != nil {
-		return nil, fmt.Errorf("converting json result to map: %w", err)
+type ToolCallAnalysis struct {
+	FunctionCall        gollm.FunctionCall
+	ParsedToolCall      *tools.ToolCall
+	IsInteractive       bool
+	IsInteractiveError  error
+	ModifiesResourceStr string
+}
+
+func (c *Agent) analyzeToolCalls(ctx context.Context, toolCalls []gollm.FunctionCall) ([]ToolCallAnalysis, error) {
+	toolCallAnalysis := make([]ToolCallAnalysis, len(toolCalls))
+	for i, call := range toolCalls {
+		toolCallAnalysis[i].FunctionCall = call
+		toolCall, err := c.Tools.ParseToolInvocation(ctx, call.Name, call.Arguments)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing tool call: %w", err)
+		}
+		toolCallAnalysis[i].IsInteractive, err = toolCall.GetTool().IsInteractive(call.Arguments)
+		if err != nil {
+			toolCallAnalysis[i].IsInteractiveError = err
+		}
+		toolCallAnalysis[i].ModifiesResourceStr = toolCall.GetTool().CheckModifiesResource(call.Arguments)
+		toolCallAnalysis[i].ParsedToolCall = toolCall
 	}
-	return m, nil
+	return toolCallAnalysis, nil
+}
+
+func (c *Agent) handleChoice(ctx context.Context, choice *api.UserChoiceResponse) (dispatchToolCalls bool) {
+	log := klog.FromContext(ctx)
+	// if user input is a choice and use has declined the operation,
+	// we need to abort all pending function calls.
+	// update the currChatContent with the choice and keep the agent loop running.
+
+	// Normalize the input
+	switch choice.Choice {
+	case 1:
+		dispatchToolCalls = true
+	case 2:
+		c.SkipPermissions = true
+		dispatchToolCalls = true
+	case 3:
+		c.currChatContent = append(c.currChatContent, gollm.FunctionCallResult{
+			ID:   c.pendingFunctionCalls[0].FunctionCall.ID,
+			Name: c.pendingFunctionCalls[0].FunctionCall.Name,
+			Result: map[string]any{
+				"error":     "User declined to run this operation.",
+				"status":    "declined",
+				"retryable": false,
+			},
+		})
+		c.pendingFunctionCalls = []ToolCallAnalysis{}
+		dispatchToolCalls = false
+		c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Operation was skipped. User declined to run this operation.")
+	default:
+		// This case should technically not be reachable due to AskForConfirmation loop
+		err := fmt.Errorf("invalid confirmation choice: %q", choice.Choice)
+		log.Error(err, "Invalid choice received from AskForConfirmation")
+		c.pendingFunctionCalls = []ToolCallAnalysis{}
+		dispatchToolCalls = false
+		c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Invalid choice received. Cancelling operation.")
+	}
+	return dispatchToolCalls
 }
 
 // generateFromTemplate generates a prompt for LLM. It uses the prompt from the provides template file or default.
-func (a *Conversation) generatePrompt(_ context.Context, defaultPromptTemplate string, data PromptData) (string, error) {
+func (a *Agent) generatePrompt(_ context.Context, defaultPromptTemplate string, data PromptData) (string, error) {
 	promptTemplate := defaultPromptTemplate
 	if a.PromptTemplateFile != "" {
 		content, err := os.ReadFile(a.PromptTemplateFile)
@@ -334,6 +1104,14 @@ func (a *Conversation) generatePrompt(_ context.Context, defaultPromptTemplate s
 			return "", fmt.Errorf("error reading template file: %v", err)
 		}
 		promptTemplate = string(content)
+	}
+
+	for _, extraPromptPath := range a.ExtraPromptPaths {
+		content, err := os.ReadFile(extraPromptPath)
+		if err != nil {
+			return "", fmt.Errorf("error reading extra prompt path: %v", err)
+		}
+		promptTemplate += "\n" + string(content)
 	}
 
 	tmpl, err := template.New("promptTemplate").Parse(promptTemplate)
@@ -354,7 +1132,8 @@ type PromptData struct {
 	Query string
 	Tools tools.Tools
 
-	EnableToolUseShim bool
+	EnableToolUseShim    bool
+	SessionIsInteractive bool
 }
 
 func (a *PromptData) ToolsAsJSON() string {
@@ -458,10 +1237,6 @@ func candidateToShimCandidate(iterator gollm.ChatResponseIterator) (gollm.ChatRe
 					yield(nil, fmt.Errorf("no text part found in candidate"))
 					return
 				}
-			}
-
-			if _, found := extractJSON(buffer); found {
-				break
 			}
 		}
 

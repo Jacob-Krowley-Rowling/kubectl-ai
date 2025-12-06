@@ -35,4 +35,14 @@ type Tool interface {
 
 	// Run invokes the tool, the agent calls this when the LLM requests tool invocation.
 	Run(ctx context.Context, args map[string]any) (any, error)
+
+	// IsInteractive checks if a command is interactive
+	// If the command is interactive, we need to handle it differently in the agent
+	// Returns true if interactive, with an error explaining why it's interactive
+	IsInteractive(args map[string]any) (bool, error)
+
+	// CheckModifiesResource determines if the command modifies resources
+	// This is used for permission checks before command execution
+	// Returns "yes", "no", or "unknown"
+	CheckModifiesResource(args map[string]any) string
 }

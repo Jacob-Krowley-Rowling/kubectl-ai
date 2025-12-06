@@ -30,3 +30,21 @@ Guidelines](https://opensource.google/conduct/).
 All submissions, including submissions by project members, require review. We
 use [GitHub pull requests](https://docs.github.com/articles/about-pull-requests)
 for this purpose.
+
+## Understand the repo
+
+An AI-generated overview of the system architecture for this repository is
+available [here](https://deepwiki.com/GoogleCloudPlatform/kubectl-ai/). This can
+provide an interactive way to explore the codebase.
+
+Quick notes about the various directories:
+- Source code for `kubectl-ai` CLI lives under `cmd/` and `pkg/` directories.
+- gollm directory is an independent Go module that implements LLM clients for
+different LLM providers.
+- `k8s-ai-bench` directory contains source code and tasks for the evaluation benchmark. `k8s-ai-bench` has its own [contribution guidelines.](k8s-ai-bench/contributing.md)
+- `modelserving` directory contains utilities and configuration to build and run
+open source AI models locally or in a kubernetes cluster.
+- `kubectl-utils` is an independent Go package/binary to help with the benchmarks tasks
+that evaluates various conditions involving properties of kubernetes resources.
+- User guides/design docs/proposals live under `docs` directory.
+- `dev` directory scripts for project related tasks (adhoc/CI).

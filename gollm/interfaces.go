@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"io"
 	"iter"
+
+	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
 )
 
 // Client is a client for a language model.
@@ -48,7 +50,7 @@ type Chat interface {
 	// you do not need to "replay" any messages from the LLM.
 	Send(ctx context.Context, contents ...any) (ChatResponse, error)
 
-	// SendStreaming is the streaming verison of Send.
+	// SendStreaming is the streaming version of Send.
 	SendStreaming(ctx context.Context, contents ...any) (ChatResponseIterator, error)
 
 	// SetFunctionDefinitions configures the set of tools (functions) available to the LLM
@@ -57,6 +59,9 @@ type Chat interface {
 
 	// IsRetryableError returns true if the error is retryable.
 	IsRetryableError(error) bool
+
+	// Initialize initializes the chat with a previous conversation history.
+	Initialize(messages []*api.Message) error
 }
 
 // CompletionRequest is a request to generate a completion for a given prompt.
@@ -119,6 +124,7 @@ const (
 
 	TypeString  SchemaType = "string"
 	TypeBoolean SchemaType = "boolean"
+	TypeNumber  SchemaType = "number"
 	TypeInteger SchemaType = "integer"
 )
 

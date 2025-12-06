@@ -16,6 +16,7 @@ package gollm
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -27,6 +28,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
+
 	"k8s.io/klog/v2"
 )
 
@@ -37,7 +40,33 @@ type registry struct {
 	providers map[string]FactoryFunc
 }
 
-type FactoryFunc func(ctx context.Context, uri *url.URL) (Client, error)
+func (r *registry) listProviders() []string {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	providers := make([]string, 0, len(r.providers))
+	for k := range r.providers {
+		providers = append(providers, k)
+	}
+	return providers
+}
+
+type ClientOptions struct {
+	URL           *url.URL
+	SkipVerifySSL bool
+	// Extend with more options as needed
+}
+
+// Option is a functional option for configuring ClientOptions.
+type Option func(*ClientOptions)
+
+// WithSkipVerifySSL enables skipping SSL certificate verification for HTTP clients.
+func WithSkipVerifySSL() Option {
+	return func(o *ClientOptions) {
+		o.SkipVerifySSL = true
+	}
+}
+
+type FactoryFunc func(ctx context.Context, opts ClientOptions) (Client, error)
 
 func RegisterProvider(id string, factoryFunc FactoryFunc) error {
 	return globalRegistry.RegisterProvider(id, factoryFunc)
@@ -58,11 +87,14 @@ func (r *registry) RegisterProvider(id string, factoryFunc FactoryFunc) error {
 	return nil
 }
 
-func (r *registry) NewClient(ctx context.Context, providerID string) (Client, error) {
+func (r *registry) NewClient(ctx context.Context, providerID string, opts ...Option) (Client, error) {
 	// providerID can be just an ID, for example "gemini" instead of "gemini://"
 	if !strings.Contains(providerID, "/") && !strings.Contains(providerID, ":") {
 		providerID = providerID + "://"
 	}
+
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
 
 	u, err := url.Parse(providerID)
 	if err != nil {
@@ -71,23 +103,39 @@ func (r *registry) NewClient(ctx context.Context, providerID string) (Client, er
 
 	factoryFunc := r.providers[u.Scheme]
 	if factoryFunc == nil {
-		return nil, fmt.Errorf("provider %q not registered", u.Scheme)
+		return nil, fmt.Errorf("provider %q not registered. Available providers: %v", u.Scheme, r.listProviders())
 	}
 
-	return factoryFunc(ctx, u)
+	// Build ClientOptions
+	clientOpts := ClientOptions{
+		URL: u,
+	}
+	// Support environment variable override for SkipVerifySSL
+	if v := os.Getenv("LLM_SKIP_VERIFY_SSL"); v == "1" || strings.ToLower(v) == "true" {
+		clientOpts.SkipVerifySSL = true
+	}
+	for _, opt := range opts {
+		opt(&clientOpts)
+	}
+
+	return factoryFunc(ctx, clientOpts)
 }
 
-// NewClient builds an Client based on the LLM_CLIENT env var or the provided providerID. ProviderID (if not empty) overrides the provider from LLM_CLIENT env var.
-func NewClient(ctx context.Context, providerID string) (Client, error) {
+/*
+NewClient builds a Client based on the LLM_CLIENT environment variable or the provided providerID.
+If providerID is not empty, it overrides the value from LLM_CLIENT.
+Supports Option parameters and the LLM_SKIP_VERIFY_SSL environment variable.
+*/
+func NewClient(ctx context.Context, providerID string, opts ...Option) (Client, error) {
 	if providerID == "" {
 		s := os.Getenv("LLM_CLIENT")
 		if s == "" {
-			return nil, fmt.Errorf("LLM_CLIENT is not set")
+			return nil, fmt.Errorf("LLM_CLIENT is not set. Available providers: %v", globalRegistry.listProviders())
 		}
 		providerID = s
 	}
 
-	return globalRegistry.NewClient(ctx, providerID)
+	return globalRegistry.NewClient(ctx, providerID, opts...)
 }
 
 // APIError represents an error returned by the LLM client.
@@ -142,6 +190,22 @@ func DefaultIsRetryableError(err error) bool {
 	return false
 }
 
+// createCustomHTTPClient returns an *http.Client that optionally skips SSL certificate verification.
+// This is shared by all providers that need custom HTTP transport.
+func createCustomHTTPClient(skipVerify bool) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = http.ProxyFromEnvironment
+	if skipVerify {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+
+	}
+
+	return &http.Client{
+		Transport: transport,
+		Timeout:   180 * time.Second,
+	}
+}
+
 // RetryConfig holds the configuration for the retry mechanism (same as before)
 type RetryConfig struct {
 	MaxAttempts    int
@@ -176,11 +240,11 @@ func Retry[T any](
 	backoff := config.InitialBackoff
 
 	for attempt := 1; attempt <= config.MaxAttempts; attempt++ {
-		// log.Printf("Executing operation, attempt %d of %d", attempt, config.MaxAttempts) // Optional verbose log
+		log.V(2).Info("Retry attempt started", "attempt", attempt, "maxAttempts", config.MaxAttempts, "backoff", backoff)
 		result, err := operation(ctx)
 
 		if err == nil {
-			// Success
+			log.V(2).Info("Retry attempt succeeded", "attempt", attempt)
 			return result, nil
 		}
 		lastErr = err // Store the last error encountered
@@ -212,7 +276,7 @@ func Retry[T any](
 			waitTime += time.Duration(rand.Float64() * float64(backoff) / 2)
 		}
 
-		log.Info("Waiting before next attempt", "waitTime", waitTime, "attempt", attempt+1, "maxAttempts", config.MaxAttempts)
+		log.V(2).Info("Waiting before next retry attempt", "waitTime", waitTime, "nextAttempt", attempt+1, "maxAttempts", config.MaxAttempts)
 
 		// Wait or react to context cancellation
 		select {
@@ -249,7 +313,6 @@ func NewRetryChat[C Chat](
 	underlying C,
 	config RetryConfig,
 ) Chat {
-
 	return &retryChat[C]{
 		underlying: underlying,
 		config:     config,
@@ -269,7 +332,6 @@ func (rc *retryChat[C]) Send(ctx context.Context, contents ...any) (ChatResponse
 
 // Embed implements the Client interface for the retryClient decorator.
 func (rc *retryChat[C]) SendStreaming(ctx context.Context, contents ...any) (ChatResponseIterator, error) {
-	// TODO: Retry logic
 	return rc.underlying.SendStreaming(ctx, contents...)
 }
 
@@ -279,4 +341,8 @@ func (rc *retryChat[C]) SetFunctionDefinitions(functionDefinitions []*FunctionDe
 
 func (rc *retryChat[C]) IsRetryableError(err error) bool {
 	return rc.underlying.IsRetryableError(err)
+}
+
+func (rc *retryChat[C]) Initialize(messages []*api.Message) error {
+	return rc.underlying.Initialize(messages)
 }

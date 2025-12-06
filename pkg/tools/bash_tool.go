@@ -15,23 +15,19 @@
 package tools
 
 import (
-	"bytes"
 	"context"
+	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/gollm"
+	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/sandbox"
 )
 
-func init() {
-	RegisterTool(&BashTool{})
-}
-
 const (
-	bashBin = "/bin/bash"
+	defaultBashBin = "/bin/bash"
 )
 
 // expandShellVar expands shell variables and syntax using bash
@@ -48,7 +44,13 @@ func expandShellVar(value string) (string, error) {
 	return os.ExpandEnv(value), nil
 }
 
-type BashTool struct{}
+type BashTool struct {
+	executor sandbox.Executor
+}
+
+func NewBashTool(executor sandbox.Executor) *BashTool {
+	return &BashTool{executor: executor}
+}
 
 func (t *BashTool) Name() string {
 	return "bash"
@@ -84,58 +86,63 @@ Possible values:
 }
 
 func (t *BashTool) Run(ctx context.Context, args map[string]any) (any, error) {
-	kubeconfig := ctx.Value("kubeconfig").(string)
-	workDir := ctx.Value("work_dir").(string)
+	kubeconfig := ctx.Value(KubeconfigKey).(string)
+	workDir := ctx.Value(WorkDirKey).(string)
 	command := args["command"].(string)
 
-	if strings.Contains(command, "kubectl edit") {
-		return &ExecResult{Error: "interactive mode not supported for kubectl, please use non-interactive commands"}, nil
-	}
-	if strings.Contains(command, "kubectl port-forward") {
-		return &ExecResult{Error: "port-forwarding is not allowed because assistant is running in an unattended mode, please try some other alternative"}, nil
+	if err := validateCommand(command); err != nil {
+		return &sandbox.ExecResult{Command: command, Error: err.Error()}, nil
 	}
 
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		cmd = exec.CommandContext(ctx, os.Getenv("COMSPEC"), "/c", command)
-	} else {
-		cmd = exec.CommandContext(ctx, bashBin, "-c", command)
-	}
-	cmd.Dir = workDir
-	cmd.Env = os.Environ()
+	// Prepare environment
+	env := os.Environ()
 	if kubeconfig != "" {
 		kubeconfig, err := expandShellVar(kubeconfig)
 		if err != nil {
 			return nil, err
 		}
-		cmd.Env = append(cmd.Env, "KUBECONFIG="+kubeconfig)
+		env = append(env, "KUBECONFIG="+kubeconfig)
 	}
 
-	return executeCommand(cmd)
+	return ExecuteWithStreamingHandling(ctx, t.executor, command, workDir, env, DetectKubectlStreaming)
 }
 
-type ExecResult struct {
-	Error    string `json:"error,omitempty"`
-	Stdout   string `json:"stdout,omitempty"`
-	Stderr   string `json:"stderr,omitempty"`
-	ExitCode int    `json:"exit_code,omitempty"`
-}
-
-func executeCommand(cmd *exec.Cmd) (*ExecResult, error) {
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	results := &ExecResult{}
-	if err := cmd.Run(); err != nil {
-		if exitError, ok := err.(*exec.ExitError); ok {
-			results.ExitCode = exitError.ExitCode()
-		} else {
-			return nil, err
-		}
+func validateCommand(command string) error {
+	if strings.Contains(command, "kubectl edit") {
+		return fmt.Errorf("interactive mode not supported for kubectl, please use non-interactive commands")
 	}
-	results.Stdout = stdout.String()
-	results.Stderr = stderr.String()
-	return results, nil
+	if strings.Contains(command, "kubectl port-forward") {
+		return fmt.Errorf("port-forwarding is not allowed because assistant is running in an unattended mode, please try some other alternative")
+	}
+	return nil
+}
+
+func (t *BashTool) IsInteractive(args map[string]any) (bool, error) {
+	commandVal, ok := args["command"]
+	if !ok || commandVal == nil {
+		return false, nil
+	}
+
+	command, ok := commandVal.(string)
+	if !ok {
+		return false, nil
+	}
+
+	return IsInteractiveCommand(command)
+}
+
+// CheckModifiesResource determines if the command modifies kubernetes resources
+// This is used for permission checks before command execution
+// Returns "yes", "no", or "unknown"
+func (t *BashTool) CheckModifiesResource(args map[string]any) string {
+	command, ok := args["command"].(string)
+	if !ok {
+		return "unknown"
+	}
+
+	if strings.Contains(command, "kubectl") {
+		return kubectlModifiesResource(command)
+	}
+
+	return "unknown"
 }

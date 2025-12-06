@@ -23,24 +23,30 @@ import (
 	"iter"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"strings"
 
 	"google.golang.org/genai"
 
+	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
+
 	"k8s.io/klog/v2"
 )
 
 func init() {
-	RegisterProvider("gemini", geminiFactory)
-	RegisterProvider("vertexai", vertexaiViaGeminiFactory)
+	if err := RegisterProvider("gemini", geminiFactory); err != nil {
+		klog.Fatalf("Failed to register gemini provider: %v", err)
+	}
+	if err := RegisterProvider("vertexai", vertexaiViaGeminiFactory); err != nil {
+		klog.Fatalf("Failed to register vertexai provider: %v", err)
+	}
 }
 
-func geminiFactory(ctx context.Context, u *url.URL) (Client, error) {
+// geminiFactory is the provider factory function for Gemini.
+// Supports ClientOptions for consistency, but skipVerifySSL is not used.
+func geminiFactory(ctx context.Context, opts ClientOptions) (Client, error) {
 	opt := GeminiAPIClientOptions{}
-
 	return NewGeminiAPIClient(ctx, opt)
 }
 
@@ -59,9 +65,13 @@ func NewGeminiAPIClient(ctx context.Context, opt GeminiAPIClientOptions) (*Googl
 	if apiKey == "" {
 		return nil, fmt.Errorf("GEMINI_API_KEY environment variable not set")
 	}
+	skipVerifySSL := false
+	httpClient := createCustomHTTPClient(skipVerifySSL)
+	httpClient = withJournaling(httpClient)
 	cc := &genai.ClientConfig{
-		APIKey:  apiKey,
-		Backend: genai.BackendGeminiAPI,
+		APIKey:     apiKey,
+		Backend:    genai.BackendGeminiAPI,
+		HTTPClient: httpClient,
 	}
 
 	client, err := genai.NewClient(ctx, cc)
@@ -82,9 +92,10 @@ type VertexAIClientOptions struct {
 	Location string
 }
 
-func vertexaiViaGeminiFactory(ctx context.Context, u *url.URL) (Client, error) {
+// vertexaiViaGeminiFactory is the provider factory function for VertexAI via Gemini.
+// Supports ClientOptions for consistency, but skipVerifySSL is not used.
+func vertexaiViaGeminiFactory(ctx context.Context, opts ClientOptions) (Client, error) {
 	opt := VertexAIClientOptions{}
-
 	return NewVertexAIClient(ctx, opt)
 }
 
@@ -165,8 +176,9 @@ func NewVertexAIClient(ctx context.Context, opt VertexAIClientOptions) (*GoogleA
 	}
 
 	client, err := genai.NewClient(ctx, cc)
+
 	if err != nil {
-		return nil, fmt.Errorf("building gemini client: %w", err)
+		return nil, fmt.Errorf("building vertexai client: %w", err)
 	}
 
 	return &GoogleAIClient{
@@ -300,6 +312,9 @@ type GeminiChat struct {
 func (c *GeminiChat) SetFunctionDefinitions(functionDefinitions []*FunctionDefinition) error {
 	var genaiFunctionDeclarations []*genai.FunctionDeclaration
 	for _, functionDefinition := range functionDefinitions {
+		if functionDefinition.Parameters == nil {
+			return fmt.Errorf("function %q has no parameters", functionDefinition.Name)
+		}
 		parameters, err := toGeminiSchema(functionDefinition.Parameters)
 		if err != nil {
 			return err
@@ -330,6 +345,8 @@ func toGeminiSchema(schema *Schema) (*genai.Schema, error) {
 		ret.Type = genai.TypeObject
 	case TypeString:
 		ret.Type = genai.TypeString
+	case TypeNumber:
+		ret.Type = genai.TypeNumber
 	case TypeBoolean:
 		ret.Type = genai.TypeBoolean
 	case TypeInteger:
@@ -381,7 +398,7 @@ func (c *GeminiChat) partsToGemini(contents ...any) ([]*genai.Part, error) {
 	return parts, nil
 }
 
-// SendMessage sends a message to the model.
+// Send sends a message to the model.
 // It returns a ChatResponse object containing the response from the model.
 func (c *GeminiChat) Send(ctx context.Context, contents ...any) (ChatResponse, error) {
 	log := klog.FromContext(ctx)
@@ -437,21 +454,73 @@ func (c *GeminiChat) SendStreaming(ctx context.Context, contents ...any) (ChatRe
 				return
 			}
 
-			var response *GeminiChatResponse
-			if geminiResponse != nil {
-				response = &GeminiChatResponse{geminiResponse: geminiResponse}
-
-				if len(geminiResponse.Candidates) > 0 {
-					// TODO: Should we try to coalesce parts when we have a streaming response?
-					c.history = append(c.history, geminiResponse.Candidates[0].Content)
-				}
+			if err != nil {
+				// Always check for and yield an error first.
+				yield(nil, err)
+				return
 			}
 
-			if !yield(response, err) {
+			if geminiResponse == nil || len(geminiResponse.Candidates) == 0 {
+				return
+			}
+
+			content := geminiResponse.Candidates[0].Content
+			partsIsEmpty := true
+			if content != nil {
+				for _, part := range content.Parts {
+					if part.Text != "" || part.FunctionCall != nil {
+						partsIsEmpty = false
+						break
+					}
+				}
+			}
+			if partsIsEmpty {
+				// This happens when there is empty content with the finish reason (STOP) to indicate that streaming response is finished.
+				// xref: https://github.com/GoogleCloudPlatform/kubectl-ai/issues/306
+				log.V(1).Info("empty response probably with STOP finishedReason")
+				return
+			}
+			c.history = append(c.history, content)
+			// yield only when we have a non-empty response
+			if !yield(&GeminiChatResponse{geminiResponse: geminiResponse}, err) {
 				return
 			}
 		}
 	}, nil
+}
+
+func (c *GeminiChat) Initialize(messages []*api.Message) error {
+	klog.Info("Initializing gemini chat")
+	c.history = make([]*genai.Content, 0, len(messages))
+	for _, msg := range messages {
+		content, err := c.messageToContent(msg)
+		if err != nil {
+			continue
+		}
+		c.history = append(c.history, content)
+	}
+	return nil
+}
+
+func (c *GeminiChat) messageToContent(msg *api.Message) (*genai.Content, error) {
+	var role string
+	switch msg.Source {
+	case api.MessageSourceUser:
+		role = "user"
+	case api.MessageSourceModel:
+		role = "model"
+	case api.MessageSourceAgent:
+		role = "user" // Treat agent messages as user messages for Gemini history
+	default:
+		return nil, fmt.Errorf("unknown message source: %s", msg.Source)
+	}
+
+	parts, err := c.partsToGemini(msg.Payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert message payload to parts: %w", err)
+	}
+
+	return &genai.Content{Role: role, Parts: parts}, nil
 }
 
 // GeminiChatResponse is a response from the Gemini API.

@@ -18,63 +18,87 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"os"
+	"slices"
 	"strings"
+
+	"k8s.io/klog/v2"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/ai/azopenai"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/cognitiveservices/armcognitiveservices"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/subscription/armsubscription"
+
+	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
 )
 
 func init() {
-	RegisterProvider("azopenai", azureOpenAIFactory)
+	if err := RegisterProvider("azopenai", azureOpenAIFactory); err != nil {
+		klog.Fatalf("Failed to register azopenai provider: %v", err)
+	}
 }
 
-func azureOpenAIFactory(ctx context.Context, u *url.URL) (Client, error) {
-	return NewAzureOpenAIClient(ctx, *u)
+/*
+azureOpenAIFactory is the provider factory function for Azure OpenAI.
+Supports ClientOptions for custom configuration.
+*/
+func azureOpenAIFactory(ctx context.Context, opts ClientOptions) (Client, error) {
+	return NewAzureOpenAIClient(ctx, opts)
 }
 
 type AzureOpenAIClient struct {
-	client *azopenai.Client
+	client   *azopenai.Client
+	endpoint string
 }
 
 var _ Client = &AzureOpenAIClient{}
 
-func NewAzureOpenAIClient(ctx context.Context, u url.URL) (*AzureOpenAIClient, error) {
+// NewAzureOpenAIClient creates a new Azure OpenAI client.
+// Supports ClientOptions and SkipVerifySSL for custom HTTP transport.
+func NewAzureOpenAIClient(ctx context.Context, opts ClientOptions) (*AzureOpenAIClient, error) {
 	azureOpenAIEndpoint := os.Getenv("AZURE_OPENAI_ENDPOINT")
-	if u.Host != "" {
-		u.Scheme = "https"
-		azureOpenAIEndpoint = u.String()
-
+	if opts.URL != nil && opts.URL.Host != "" {
+		opts.URL.Scheme = "https"
+		azureOpenAIEndpoint = opts.URL.String()
 	}
 	if azureOpenAIEndpoint == "" {
 		return nil, fmt.Errorf("AZURE_OPENAI_ENDPOINT environment variable not set")
 	}
+	azureOpenAIClient := AzureOpenAIClient{
+		endpoint: azureOpenAIEndpoint,
+	}
 
-	azureOpenAIClient := AzureOpenAIClient{}
+	// Create a custom HTTP client (supports SkipVerifySSL)
+	httpClient := createCustomHTTPClient(opts.SkipVerifySSL)
+
 	azureOpenAIKey := os.Getenv("AZURE_OPENAI_API_KEY")
+	clientOpts := &azopenai.ClientOptions{
+		ClientOptions: azcore.ClientOptions{
+			Transport: httpClient,
+		},
+	}
 	if azureOpenAIKey != "" {
 		keyCredential := azcore.NewKeyCredential(azureOpenAIKey)
-		client, err := azopenai.NewClientWithKeyCredential(azureOpenAIEndpoint, keyCredential, nil)
+		client, err := azopenai.NewClientWithKeyCredential(azureOpenAIEndpoint, keyCredential, clientOpts)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to create azure openai client: %w", err)
 		}
 		azureOpenAIClient.client = client
 	} else {
 		credential, err := azidentity.NewDefaultAzureCredential(nil)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to get credential: %w", err)
 		}
-		client, err := azopenai.NewClient(azureOpenAIEndpoint, credential, nil)
+		client, err := azopenai.NewClient(azureOpenAIEndpoint, credential, clientOpts)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to create azure openai client: %w", err)
 		}
 		azureOpenAIClient.client = client
 	}
 
 	return &azureOpenAIClient, nil
-
 }
 
 func (c *AzureOpenAIClient) Close() error {
@@ -94,7 +118,7 @@ func (c *AzureOpenAIClient) GenerateCompletion(ctx context.Context, request *Com
 		return nil, err
 	}
 
-	if len(resp.Choices) > 0 || resp.Choices[0].Message == nil || resp.Choices[0].Message.Content == nil {
+	if len(resp.Choices) == 0 || resp.Choices[0].Message == nil || resp.Choices[0].Message.Content == nil {
 		return nil, fmt.Errorf("invalid completion response: %v", resp)
 	}
 
@@ -102,7 +126,77 @@ func (c *AzureOpenAIClient) GenerateCompletion(ctx context.Context, request *Com
 }
 
 func (c *AzureOpenAIClient) ListModels(ctx context.Context) ([]string, error) {
-	return nil, fmt.Errorf("listing models not supported yet for Azure OpenAI")
+	cred, err := azidentity.NewDefaultAzureCredential(nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get credential: %w", err)
+	}
+
+	subClient, err := armsubscription.NewSubscriptionsClient(cred, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create subscriptions client: %w", err)
+	}
+
+	subPager := subClient.NewListPager(nil)
+	for subPager.More() {
+		subResp, err := subPager.NextPage(context.Background())
+		if err != nil {
+			return nil, fmt.Errorf("failed to get subscriptions page: %w", err)
+		}
+
+		for _, sub := range subResp.Value {
+			accountClient, err := armcognitiveservices.NewAccountsClient(*sub.SubscriptionID, cred, nil)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create accounts client: %w", err)
+			}
+
+			accountPager := accountClient.NewListPager(nil)
+			for accountPager.More() {
+				accountResp, err := accountPager.NextPage(context.Background())
+				if err != nil {
+					return nil, fmt.Errorf("failed to to get accounts page: %w", err)
+				}
+
+				for _, account := range accountResp.Value {
+					if account.Kind == nil || !slices.Contains([]string{"OpenAI", "CognitiveServices", "AIServices"}, *account.Kind) {
+						// Not an Azure OpenAI service
+						continue
+					}
+					if account.Properties == nil || account.Properties.Endpoint == nil || strings.TrimSuffix(*account.Properties.Endpoint, "/") != c.endpoint {
+						// Not the expected endpoint
+						continue
+					}
+
+					resourceID, err := arm.ParseResourceID(*account.ID)
+					if err != nil {
+						return nil, fmt.Errorf("failed to parse resource ID %q: %w", *account.Name, err)
+					}
+
+					deploymentClient, err := armcognitiveservices.NewDeploymentsClient(*sub.SubscriptionID, cred, nil)
+					if err != nil {
+						return nil, fmt.Errorf("failed to create deployments client: %w", err)
+					}
+
+					var modelNames []string
+					deploymentPager := deploymentClient.NewListPager(resourceID.ResourceGroupName, *account.Name, nil)
+					for deploymentPager.More() {
+						deploymentResp, err := deploymentPager.NextPage(context.Background())
+						if err != nil {
+							return nil, fmt.Errorf("failed to get deployments page: %w", err)
+						}
+
+						for _, deployment := range deploymentResp.Value {
+							modelNames = append(modelNames, *deployment.Name)
+						}
+
+					}
+					slices.Sort(modelNames)
+					return modelNames, nil
+				}
+			}
+		}
+	}
+
+	return nil, nil
 }
 
 func (c *AzureOpenAIClient) SetResponseSchema(schema *Schema) error {
@@ -174,6 +268,11 @@ func (c *AzureOpenAIChat) Send(ctx context.Context, contents ...any) (ChatRespon
 func (c *AzureOpenAIChat) IsRetryableError(err error) bool {
 	// TODO: Implement this
 	return false
+}
+
+func (c *AzureOpenAIChat) Initialize(messages []*api.Message) error {
+	klog.Warning("chat history persistence is not supported for provider 'azopenai', using in-memory chat history")
+	return nil
 }
 
 func (c *AzureOpenAIChat) SendStreaming(ctx context.Context, contents ...any) (ChatResponseIterator, error) {

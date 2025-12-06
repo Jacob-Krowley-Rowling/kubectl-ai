@@ -18,22 +18,28 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/url"
 
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/envconfig"
 	"k8s.io/klog/v2"
+
+	kctlApi "github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
 )
 
 func init() {
-	RegisterProvider("ollama", ollamaFactory)
+	if err := RegisterProvider("ollama", ollamaFactory); err != nil {
+		klog.Fatalf("Failed to register ollama provider: %v", err)
+	}
 }
 
-func ollamaFactory(ctx context.Context, u *url.URL) (Client, error) {
-	return NewOllamaClient(ctx)
+// ollamaFactory is the provider factory function for Ollama.
+// Supports ClientOptions for custom configuration, including skipVerifySSL.
+func ollamaFactory(ctx context.Context, opts ClientOptions) (Client, error) {
+	return NewOllamaClient(ctx, opts)
 }
 
 const (
-	defaultOllamaModel = "gemma2:latest"
+	defaultOllamaModel = "gemma3:latest"
 )
 
 type OllamaClient struct {
@@ -49,11 +55,12 @@ type OllamaChat struct {
 
 var _ Client = &OllamaClient{}
 
-func NewOllamaClient(ctx context.Context) (*OllamaClient, error) {
-	client, err := api.ClientFromEnvironment()
-	if err != nil {
-		return nil, err
-	}
+// NewOllamaClient creates a new client for Ollama.
+// Supports custom HTTP client and skipVerifySSL via ClientOptions if the SDK supports it.
+func NewOllamaClient(ctx context.Context, opts ClientOptions) (*OllamaClient, error) {
+	// Create custom HTTP client with SSL verification option from client options
+	httpClient := createCustomHTTPClient(opts.SkipVerifySSL)
+	client := api.NewClient(envconfig.Host(), httpClient)
 
 	return &OllamaClient{
 		client: client,
@@ -200,6 +207,11 @@ func (c *OllamaChat) SendStreaming(ctx context.Context, contents ...any) (ChatRe
 		return nil, err
 	}
 	return singletonChatResponseIterator(response), nil
+}
+
+func (c *OllamaChat) Initialize(messages []*kctlApi.Message) error {
+	klog.Warning("chat history persistence is not supported for provider 'ollama', using in-memory chat history")
+	return nil
 }
 
 type OllamaChatResponse struct {

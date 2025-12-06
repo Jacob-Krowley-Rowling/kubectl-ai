@@ -1,5 +1,5 @@
 # Binary
-kubectl-ai
+./kubectl-ai
 bin/
 .build/
 
@@ -27,3 +27,9 @@ app.log
 .aider*
 # Added by goreleaser init:
 dist/
+
+# Ignore generated credentials from google-github-actions/auth
+gha-creds-*.json
+
+# air config
+.air.toml
