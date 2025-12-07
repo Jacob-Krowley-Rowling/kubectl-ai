@@ -23,6 +23,8 @@ cd ${REPO_ROOT}
 if ! command -v mockgen &> /dev/null; then
   echo "mockgen not found, installing..."
   go install go.uber.org/mock/mockgen@latest
+  # Add GOPATH/bin to PATH so go generate can find mockgen
+  export PATH="$(go env GOPATH)/bin:${PATH}"
 fi
 
 # We run generate to see if it creates any diffs.
