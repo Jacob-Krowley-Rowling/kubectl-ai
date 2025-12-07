@@ -1,0 +1,77 @@
+# Enhanced MCP Configuration for Automation
+# This configuration enables custom MCP servers for automated workflows
+
+servers:
+  # Default: Sequential thinking for advanced reasoning
+  - name: sequential-thinking
+    command: npx
+    args:
+      - -y
+      - "@modelcontextprotocol/server-sequential-thinking"
+    # Sequential thinking provides step-by-step analysis and reasoning
+    # Useful for complex multi-step automation tasks
+
+  # Example: Add custom MCP servers below
+  # 
+  # Local stdio-based MCP server example:
+  # - name: custom-automation-tools
+  #   command: /path/to/your/mcp-server
+  #   args:
+  #     - --config
+  #     - /path/to/config.json
+  #   env:
+  #     API_KEY: "${CUSTOM_API_KEY}"
+  #     LOG_LEVEL: "info"
+  #
+  # Remote HTTP-based MCP server example:
+  # - name: cloud-automation-api
+  #   url: https://automation-api.example.com/mcp
+  #   timeout: 30
+  #   use_streaming: true
+  #   auth:
+  #     type: bearer
+  #     token: "${CLOUD_API_TOKEN}"
+  #   headers:
+  #     X-API-Version: "v1"
+  #     X-Client-ID: "kubectl-ai-automation"
+  #
+  # Database MCP server example:
+  # - name: postgres-tools
+  #   command: npx
+  #   args:
+  #     - -y
+  #     - "@modelcontextprotocol/server-postgres"
+  #     - "postgresql://user:pass@localhost/dbname"
+  #
+  # Filesystem MCP server example:
+  # - name: filesystem-tools
+  #   command: npx
+  #   args:
+  #     - -y
+  #     - "@modelcontextprotocol/server-filesystem"
+  #     - "/allowed/path"
+  #
+  # Custom organization tools:
+  # - name: org-deployment-tools
+  #   url: https://internal-automation.company.com/mcp
+  #   auth:
+  #     type: api-key
+  #     api_key: "${ORG_API_KEY}"
+  #     header_name: "X-Org-Api-Key"
+
+# Environment variable usage:
+# - Use ${VAR_NAME} syntax to reference environment variables
+# - Variables are expanded at runtime
+# - Useful for keeping secrets out of config files
+#
+# Example environment variables:
+# export CUSTOM_API_KEY=your-key-here
+# export CLOUD_API_TOKEN=your-token-here
+# export ORG_API_KEY=your-org-key
+
+# Security notes:
+# - Only connect to trusted MCP servers
+# - MCP servers run with same permissions as kubectl-ai
+# - Use environment variables for sensitive data
+# - Review MCP server documentation for security considerations
+# - This file should have restricted permissions (0600)

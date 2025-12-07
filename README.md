@@ -18,6 +18,7 @@ efficient.
   - [Usage](#usage)
 - [Configuration](#configuration)
 - [Tools](#tools)
+- [Automation Mode](#automation-mode)
 - [Docker Quick Start](#docker-quick-start)
 - [MCP Client Mode](#mcp-client-mode)
 - [Extras](#extras)
@@ -316,6 +317,72 @@ To specify tools configuration files or directories containing tools configurati
 ```
 
 For further details on how to configure your own tools, [go here](docs/tools.md).
+
+## Automation Mode
+
+`kubectl-ai` supports fully automated workflows with auto-iteration and MCP integration for hands-free Kubernetes operations.
+
+### Key Features
+
+- **Auto-approval**: Skip all confirmation prompts with `--skip-permissions`
+- **Auto-iteration**: Automatically retry and refine operations up to `--max-iterations`
+- **MCP Integration**: Use custom tools via `--mcp-client` mode
+- **Batch Processing**: Execute multiple operations from task files
+- **Multi-Cluster**: Automate deployments across clusters
+
+### Quick Start
+
+```bash
+# Enable automation mode (auto-approve + MCP client)
+kubectl-ai --skip-permissions --mcp-client --quiet "deploy nginx with 3 replicas"
+
+# Use the automation script for streamlined workflows
+./automation/kubectl-ai-auto.sh "deploy nginx with 3 replicas in production"
+
+# Run batch automation from file
+./automation/kubectl-ai-auto.sh --batch deployment-tasks.txt
+```
+
+### Automation Script
+
+The included automation script (`automation/kubectl-ai-auto.sh`) provides a convenient wrapper with:
+
+```bash
+# Initialize automation configuration
+./automation/kubectl-ai-auto.sh --init
+
+# Run automated deployment
+./automation/kubectl-ai-auto.sh "deploy myapp in production namespace"
+
+# Batch processing
+./automation/kubectl-ai-auto.sh --batch tasks.txt
+
+# Custom iteration limit for complex operations
+./automation/kubectl-ai-auto.sh --iterations 30 "diagnose and fix all failing pods"
+```
+
+### Multi-Cluster Automation
+
+Deploy across multiple clusters seamlessly:
+
+```bash
+# Edit cluster-deployment.sh with your cluster contexts
+./automation/cluster-deployment.sh
+```
+
+### Configuration
+
+Create `~/.config/kubectl-ai/automation.yaml`:
+
+```yaml
+skipPermissions: true    # Auto-approve all operations
+maxIterations: 20        # Max auto-iteration attempts
+mcpClient: true          # Enable MCP tools
+quiet: true              # Non-interactive mode
+showToolOutput: true     # Display command output
+```
+
+📖 **For complete automation documentation, examples, and best practices, see [automation/README.md](automation/README.md).**
 
 ## Docker Quick Start
 

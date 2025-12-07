@@ -1,0 +1,21 @@
+# Example Deployment Automation Tasks
+# Each line is a kubectl-ai query that will be executed automatically
+# Lines starting with # are comments and will be skipped
+
+# Check cluster health
+check the health of all nodes in the cluster
+
+# Deploy applications
+deploy nginx deployment with 3 replicas in default namespace
+
+# Create services
+create a service for nginx deployment exposing port 80
+
+# Scale applications
+scale nginx deployment to 5 replicas
+
+# Check pod status
+list all pods in default namespace with their status
+
+# Verify deployment
+get details of nginx deployment including resource usage
