@@ -50,8 +50,7 @@ check_prerequisites() {
     if [ ! -f "${KUBECTL_AI_BIN}" ]; then
         log_error "kubectl-ai binary not found at ${KUBECTL_AI_BIN}"
         log_info "Building kubectl-ai..."
-        cd "${PROJECT_ROOT}" && make build
-        if [ $? -eq 0 ]; then
+        if cd "${PROJECT_ROOT}" && make build; then
             log_success "kubectl-ai built successfully"
         else
             log_error "Failed to build kubectl-ai"
@@ -150,9 +149,7 @@ run_automated() {
     echo ""
     
     # Execute the command
-    eval "${cmd}"
-    
-    if [ $? -eq 0 ]; then
+    if eval "${cmd}"; then
         log_success "Automation completed successfully"
         return 0
     else
