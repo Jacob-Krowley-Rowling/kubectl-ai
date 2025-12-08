@@ -20,6 +20,9 @@ set -o pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd ${REPO_ROOT}
 
+# Ensure GOPATH/bin is in PATH for installed Go tools
+export PATH="${PATH}:$(go env GOPATH)/bin"
+
 if ! command -v mockgen &> /dev/null; then
   echo "mockgen not found, installing..."
   go install go.uber.org/mock/mockgen@latest
