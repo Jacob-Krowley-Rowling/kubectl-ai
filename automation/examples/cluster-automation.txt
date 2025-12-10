@@ -1,0 +1,20 @@
+# Cluster-wide Automation Tasks
+# Automated cluster management and monitoring tasks
+
+# Check cluster status
+get cluster version and API server status
+
+# List all namespaces
+list all namespaces in the cluster
+
+# Check resource utilization
+show resource utilization for all nodes
+
+# Verify system pods
+check if all system pods in kube-system namespace are running
+
+# List all services
+list all services across all namespaces
+
+# Check for any pods with errors
+find all pods with error or crash loop status across all namespaces

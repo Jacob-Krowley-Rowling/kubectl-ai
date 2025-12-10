@@ -9,6 +9,12 @@ trace.log
 prompt.log
 app.log
 
+# Automation artifacts
+automation/*.log
+automation/examples/*.log
+automation/tmp/
+automation/.automation-state
+
 # OS specific files
 .DS_Store
 .env
